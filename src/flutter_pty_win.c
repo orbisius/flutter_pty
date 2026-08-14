@@ -161,11 +161,15 @@ typedef struct ReadLoopOptions
 
 } ReadLoopOptions;
 
+// See the note in flutter_pty_unix.c — one read is one Dart port message, so the
+// read size is what decides throughput under heavy output.
+#define PTY_READ_BUFFER_SIZE (64 * 1024)
+
 static DWORD WINAPI read_loop(LPVOID arg)
 {
     ReadLoopOptions *options = (ReadLoopOptions *)arg;
 
-    char buffer[1024];
+    char buffer[PTY_READ_BUFFER_SIZE];
 
     while (1)
     {

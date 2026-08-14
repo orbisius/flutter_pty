@@ -42,11 +42,22 @@ typedef struct ReadLoopOptions
 
 char *error_message = NULL;
 
+// One read is one Dart port message, and each message costs a typed-data
+// allocation, a stream event and the GC that follows. The read SIZE therefore
+// decides throughput under heavy output far more than the byte count does: at
+// 1 KB, 15 MB of output became ~15,000 messages and the isolate spent its time
+// on message machinery instead of the terminal.
+//
+// read() returns as soon as any data is available and never waits to fill this,
+// so an echoed keystroke still arrives in one small read — interactive latency
+// is unaffected.
+#define PTY_READ_BUFFER_SIZE (64 * 1024)
+
 static void *read_loop(void *arg)
 {
     ReadLoopOptions *options = (ReadLoopOptions *)arg;
 
-    char buffer[1024];
+    char buffer[PTY_READ_BUFFER_SIZE];
 
     while (1)
     {
