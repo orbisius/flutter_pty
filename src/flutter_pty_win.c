@@ -165,6 +165,13 @@ typedef struct ReadLoopOptions
 // read size is what decides throughput under heavy output.
 #define PTY_READ_BUFFER_SIZE (64 * 1024)
 
+// How many reads may be outstanding before the reader waits for the app to
+// acknowledge one. A single permit lets no reading happen while the app parses,
+// which costs most of the throughput; a few permits bound the read-ahead without
+// giving that up. The bound is the point — it is what keeps a flood from queueing
+// thousands of messages ahead of the user's next keystroke.
+#define PTY_READ_CREDITS 4
+
 static DWORD WINAPI read_loop(LPVOID arg)
 {
     ReadLoopOptions *options = (ReadLoopOptions *)arg;
@@ -407,9 +414,9 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     // CloseHandle(processInfo.hThread);
 
     HANDLE mutex = CreateSemaphore(
-        NULL, // default security attributes
-        1,    // initial count
-        1,    // maximum count
+        NULL,               // default security attributes
+        PTY_READ_CREDITS,   // initial count
+        PTY_READ_CREDITS,   // maximum count
         NULL);
 
     start_read_thread(outputReadSide, options->stdout_port, mutex, options->ackRead);
