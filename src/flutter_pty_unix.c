@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include <pthread.h>
+#include <semaphore.h>
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -16,13 +17,25 @@
 #include "include/dart_api_dl.h"
 #include "include/dart_native_api.h"
 
+// How many reads may be outstanding before the reader has to wait for the app to
+// acknowledge one.
+//
+// A COUNTING semaphore rather than a mutex, for two reasons. Correctness: the ack
+// comes from a different thread than the one that took the lock, and unlocking a
+// pthread mutex from a foreign thread is undefined — measured as a segfault.
+// Throughput: a single permit would serialize reading against parsing and cost a
+// whole core of pipelining (measured 10x slower), while a few permits let the
+// reader run ahead a bounded amount. The bound is the point — it is what stops a
+// flood queueing thousands of messages ahead of the user's next keystroke.
+#define PTY_READ_CREDITS 4
+
 typedef struct PtyHandle
 {
     int ptm;
 
     int pid;
 
-    pthread_mutex_t mutex;
+    sem_t read_credits;
 
     bool ackRead;
 
@@ -32,7 +45,7 @@ typedef struct ReadLoopOptions
 {
     int fd;
 
-    pthread_mutex_t *mutex;
+    sem_t *read_credits;
 
     Dart_Port port;
 
@@ -63,9 +76,9 @@ static void *read_loop(void *arg)
     {
         if (options->waitForReadAck)
         {
-            // if we are in ack mode then we get a mutex here that is
-            // freed again once the chunk of data has been processed
-            pthread_mutex_lock(options->mutex);
+            // Spend a credit to read. The app returns it once it has processed
+            // the chunk, so at most PTY_READ_CREDITS reads can be in flight.
+            sem_wait(options->read_credits);
         }
         ssize_t n = read(options->fd, buffer, sizeof(buffer));
 
@@ -92,7 +105,7 @@ static void *read_loop(void *arg)
     return NULL;
 }
 
-static void start_read_thread(int fd, Dart_Port port, pthread_mutex_t *mutex, bool waitForReadAck)
+static void start_read_thread(int fd, Dart_Port port, sem_t *read_credits, bool waitForReadAck)
 {
     ReadLoopOptions *options = malloc(sizeof(ReadLoopOptions));
 
@@ -100,7 +113,7 @@ static void start_read_thread(int fd, Dart_Port port, pthread_mutex_t *mutex, bo
 
     options->port = port;
 
-    options->mutex = mutex;
+    options->read_credits = read_credits;
 
     options->waitForReadAck = waitForReadAck;
 
@@ -203,10 +216,10 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 
     handle->ptm = ptm;
     handle->pid = pid;
-    pthread_mutex_init(&handle->mutex, NULL);
+    sem_init(&handle->read_credits, 0, PTY_READ_CREDITS);
     handle->ackRead = options->ackRead;
 
-    start_read_thread(ptm, options->stdout_port, &handle->mutex, options->ackRead);
+    start_read_thread(ptm, options->stdout_port, &handle->read_credits, options->ackRead);
 
     start_wait_exit_thread(pid, options->exit_port);
 
@@ -222,8 +235,9 @@ FFI_PLUGIN_EXPORT void pty_ack_read(PtyHandle *handle)
 {
     if (handle->ackRead)
     {
-        // frees the mutex so that the next chunk of data can be read
-        pthread_mutex_unlock(&handle->mutex);
+        // Hands the credit back so one more read may happen. sem_post from a
+        // different thread than sem_wait is well defined, unlike a mutex unlock.
+        sem_post(&handle->read_credits);
     }
 }
 
