@@ -4,7 +4,6 @@
 #include <stdlib.h>
 
 #include <pthread.h>
-#include <semaphore.h>
 #include <unistd.h>
 #include <termios.h>
 #include <sys/ioctl.h>
@@ -29,13 +28,87 @@
 // flood queueing thousands of messages ahead of the user's next keystroke.
 #define PTY_READ_CREDITS 4
 
+// The counting semaphore, built on a mutex + condition variable.
+//
+// NOT sem_t: unnamed POSIX semaphores are not implemented on Darwin. sem_init
+// there returns -1/ENOSYS and every later sem_wait/sem_post fails with EBADF, so
+// the reader never waited and the bound above silently did nothing on macOS while
+// working on Linux. A mutex+condvar is plain pthreads, which both platforms
+// implement, and it keeps the property the ack path needs: the thread that
+// signals is not required to be the thread that waited.
+typedef struct PtyCredits
+{
+    pthread_mutex_t mutex;
+
+    pthread_cond_t available;
+
+    unsigned int count;
+
+} PtyCredits;
+
+// Returns 0 on success, or the failing pthread error code — the CALLER MUST
+// check it. A silent init failure is exactly what hid the Darwin breakage.
+static int pty_credits_init(PtyCredits *credits, unsigned int initial)
+{
+    int mutexResult = pthread_mutex_init(&credits->mutex, NULL);
+
+    if (mutexResult != 0)
+    {
+        return mutexResult;
+    }
+
+    int condResult = pthread_cond_init(&credits->available, NULL);
+
+    if (condResult != 0)
+    {
+        pthread_mutex_destroy(&credits->mutex);
+
+        return condResult;
+    }
+
+    credits->count = initial;
+
+    return 0;
+}
+
+// Spends one credit, blocking until one is free.
+//
+// The wait is a LOOP, not an if: a condition variable may wake spuriously, and
+// several waiters may race for one credit.
+static void pty_credits_wait(PtyCredits *credits)
+{
+    pthread_mutex_lock(&credits->mutex);
+
+    while (credits->count == 0)
+    {
+        pthread_cond_wait(&credits->available, &credits->mutex);
+    }
+
+    credits->count--;
+
+    pthread_mutex_unlock(&credits->mutex);
+}
+
+// Hands one credit back. Safe from any thread — which is the whole reason this is
+// a semaphore and not a mutex the reader holds.
+static void pty_credits_post(PtyCredits *credits)
+{
+    pthread_mutex_lock(&credits->mutex);
+
+    credits->count++;
+
+    pthread_cond_signal(&credits->available);
+
+    pthread_mutex_unlock(&credits->mutex);
+}
+
 typedef struct PtyHandle
 {
     int ptm;
 
     int pid;
 
-    sem_t read_credits;
+    PtyCredits read_credits;
 
     bool ackRead;
 
@@ -45,7 +118,7 @@ typedef struct ReadLoopOptions
 {
     int fd;
 
-    sem_t *read_credits;
+    PtyCredits *read_credits;
 
     Dart_Port port;
 
@@ -78,7 +151,7 @@ static void *read_loop(void *arg)
         {
             // Spend a credit to read. The app returns it once it has processed
             // the chunk, so at most PTY_READ_CREDITS reads can be in flight.
-            sem_wait(options->read_credits);
+            pty_credits_wait(options->read_credits);
         }
         ssize_t n = read(options->fd, buffer, sizeof(buffer));
 
@@ -105,7 +178,7 @@ static void *read_loop(void *arg)
     return NULL;
 }
 
-static void start_read_thread(int fd, Dart_Port port, sem_t *read_credits, bool waitForReadAck)
+static void start_read_thread(int fd, Dart_Port port, PtyCredits *read_credits, bool waitForReadAck)
 {
     ReadLoopOptions *options = malloc(sizeof(ReadLoopOptions));
 
@@ -216,10 +289,21 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 
     handle->ptm = ptm;
     handle->pid = pid;
-    sem_init(&handle->read_credits, 0, PTY_READ_CREDITS);
     handle->ackRead = options->ackRead;
 
-    start_read_thread(ptm, options->stdout_port, &handle->read_credits, options->ackRead);
+    int creditsResult = pty_credits_init(&handle->read_credits, PTY_READ_CREDITS);
+
+    if (creditsResult != 0)
+    {
+        // Reading UNBOUNDED beats not reading at all — the terminal keeps working,
+        // it just loses the flood bound. Said out loud rather than swallowed: the
+        // previous silent failure is why this was broken on macOS for a release.
+        fprintf(stderr, "flutter_pty: read credits unavailable (%d), reading unbounded\n", creditsResult);
+
+        handle->ackRead = false;
+    }
+
+    start_read_thread(ptm, options->stdout_port, &handle->read_credits, handle->ackRead);
 
     start_wait_exit_thread(pid, options->exit_port);
 
@@ -235,9 +319,9 @@ FFI_PLUGIN_EXPORT void pty_ack_read(PtyHandle *handle)
 {
     if (handle->ackRead)
     {
-        // Hands the credit back so one more read may happen. sem_post from a
-        // different thread than sem_wait is well defined, unlike a mutex unlock.
-        sem_post(&handle->read_credits);
+        // Hands the credit back so one more read may happen. Posting from a
+        // different thread than the waiter is well defined, unlike a mutex unlock.
+        pty_credits_post(&handle->read_credits);
     }
 }
 
