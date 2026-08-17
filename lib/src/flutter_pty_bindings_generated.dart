@@ -772,6 +772,9 @@ final class PtyOptions extends ffi.Struct {
 
   @ffi.Bool()
   external bool ackRead;
+
+  @ffi.Bool()
+  external bool replaceEnvironment;
 }
 
 final class PtyHandle extends ffi.Opaque {}

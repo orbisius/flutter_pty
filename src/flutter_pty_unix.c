@@ -9,6 +9,15 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 
+#ifdef __APPLE__
+// macOS has no execvpe, and a dylib cannot link the `environ` global directly —
+// this is the documented way to reach it.
+#include <crt_externs.h>
+#define environ (*_NSGetEnviron())
+#else
+extern char **environ;
+#endif
+
 #include "forkpty.h"
 #include "flutter_pty.h"
 
@@ -236,6 +245,11 @@ static void start_wait_exit_thread(int pid, Dart_Port port)
     pthread_create(&_thread, NULL, &wait_exit_thread, options);
 }
 
+// Applies `environment` to the child, ADDING to what it inherited.
+//
+// putenv can add a variable or change its value; it cannot remove one. Use
+// replace_environment when the caller needs the environment to be exactly what
+// it passed.
 static void set_environment(char **environment)
 {
     if (environment == NULL)
@@ -248,6 +262,23 @@ static void set_environment(char **environment)
         putenv(*environment);
         environment++;
     }
+}
+
+// Makes `environment` the child's WHOLE environment, dropping everything it
+// inherited.
+//
+// Assigning `environ` rather than calling execvpe: execvpe is glibc-only, and
+// this has to work on macOS too. exec* keeps whatever `environ` points at, so
+// the assignment is what the child is left with — and it must happen in the
+// child, after the fork, or the parent's own environment would be replaced.
+static void replace_environment(char **environment)
+{
+    if (environment == NULL)
+    {
+        return;
+    }
+
+    environ = environment;
 }
 
 FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
@@ -270,7 +301,14 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
 
     if (pid == 0)
     {
-        set_environment(options->environment);
+        if (options->replaceEnvironment)
+        {
+            replace_environment(options->environment);
+        }
+        else
+        {
+            set_environment(options->environment);
+        }
 
         if (options->working_directory != NULL && strlen(options->working_directory) > 0)
         {

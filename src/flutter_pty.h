@@ -33,6 +33,21 @@ typedef struct PtyOptions
 
     bool ackRead;
 
+    /// Whether `environment` REPLACES the child's environment instead of being
+    /// added to the inherited one.
+    ///
+    /// The unix child applies `environment` with putenv, which can add a
+    /// variable or change its value but cannot REMOVE one — so a caller has no
+    /// way to stop something in the parent's environment reaching the child.
+    /// That matters for a terminal: an editor, an IDE or an agent launching the
+    /// app passes its own variables down to every shell the user opens, where
+    /// they silently change how unrelated tools behave.
+    ///
+    /// Off by default, so existing callers keep the additive behaviour. When on,
+    /// `environment` is the child's whole environment — which is already how the
+    /// Windows implementation works, so this also makes the platforms agree.
+    bool replaceEnvironment;
+
 } PtyOptions;
 
 typedef struct PtyHandle PtyHandle;
