@@ -45,6 +45,14 @@ class Pty {
   /// Spawns a process in a pseudo-terminal. The arguments have the same meaning
   /// as in [Process.start].
   /// [ackRead] indicates if the pty should wait for a call to [Pty.ackRead] before sending the next data.
+  ///
+  /// [replaceEnvironment] makes [environment] the child's WHOLE environment
+  /// rather than additions to the inherited one. Off by default, because the
+  /// unix child applies [environment] with putenv, which cannot remove a
+  /// variable — so without this a caller has no way to keep something in the
+  /// parent's environment out of the child. With it on, nothing is inherited
+  /// and nothing is seeded here: [environment] is taken as complete, which is
+  /// already how the Windows implementation behaves.
   Pty.start(
     this.executable, {
     this.arguments = const [],
@@ -53,14 +61,17 @@ class Pty {
     int rows = 25,
     int columns = 80,
     bool ackRead = false,
+    bool replaceEnvironment = false,
   }) {
     _ensureInitialized();
 
     final effectiveEnv = <String, String>{};
 
-    effectiveEnv['TERM'] = 'xterm-256color';
-    // Without this, tools like "vi" produce sequences that are not UTF-8 friendly
-    effectiveEnv['LANG'] = 'en_US.UTF-8';
+    if (!replaceEnvironment) {
+      effectiveEnv['TERM'] = 'xterm-256color';
+      // Without this, tools like "vi" produce sequences that are not UTF-8 friendly
+      effectiveEnv['LANG'] = 'en_US.UTF-8';
+    }
 
     const envValuesToCopy = {
       'LOGNAME',
@@ -71,9 +82,11 @@ class Pty {
       'PATH'
     };
 
-    for (var entry in Platform.environment.entries) {
-      if (envValuesToCopy.contains(entry.key)) {
-        effectiveEnv[entry.key] = entry.value;
+    if (!replaceEnvironment) {
+      for (var entry in Platform.environment.entries) {
+        if (envValuesToCopy.contains(entry.key)) {
+          effectiveEnv[entry.key] = entry.value;
+        }
       }
     }
 
@@ -108,6 +121,7 @@ class Pty {
     options.ref.stdout_port = _stdoutPort.sendPort.nativePort;
     options.ref.exit_port = _exitPort.sendPort.nativePort;
     options.ref.ackRead = ackRead;
+    options.ref.replaceEnvironment = replaceEnvironment;
 
     if (workingDirectory != null) {
       options.ref.working_directory = workingDirectory.toNativeUtf8().cast();
