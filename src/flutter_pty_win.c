@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <Windows.h>
 
 #include "flutter_pty.h"
@@ -6,6 +8,81 @@
 #include "include/dart_api.h"
 #include "include/dart_api_dl.h"
 #include "include/dart_native_api.h"
+
+// WRITING NEVER HAPPENS ON THE CALLER'S THREAD.
+//
+// `WriteFile` on a pipe blocks once the pipe is full and the child is not
+// reading, and the caller here is Dart's UI thread — so a paste into a program
+// that has stopped consuming stdin froze the whole app. Worse, the previous code
+// followed every write with `FlushFileBuffers`, which waits for the READER to
+// consume, so it blocked even when the pipe had room.
+//
+// The Unix side hit the same wall and is fixed the same way, so the two
+// platforms behave alike: `pty_write` copies the bytes and returns, and one
+// thread per pty drains the queue. A large paste — a 7 MB file into
+// `cat > out.txt` — streams out while the terminal stays responsive.
+typedef struct PtyWriteChunk
+{
+    char *bytes;
+
+    size_t length;
+
+    struct PtyWriteChunk *next;
+
+} PtyWriteChunk;
+
+// A runaway guard, NOT a paste limit: normal pastes are megabytes and must all
+// arrive, so this sits far above them and only catches a child that has stopped
+// reading forever.
+#define PTY_WRITE_QUEUE_MAX_BYTES (256 * 1024 * 1024)
+
+typedef struct PtyWriteQueue
+{
+    CRITICAL_SECTION lock;
+
+    CONDITION_VARIABLE pending;
+
+    PtyWriteChunk *head;
+
+    PtyWriteChunk *tail;
+
+    size_t queuedBytes;
+
+    HANDLE fileHandle;
+
+    // False when the queue could not be set up; `pty_write` then writes inline
+    // rather than losing the data.
+    BOOL running;
+
+    // Set once the pty is finished, so the writer thread stops waiting for work
+    // instead of parking forever — one leaked thread per pty otherwise.
+    BOOL closed;
+
+} PtyWriteQueue;
+
+// Defined here, above the read loop, because that loop takes the HANDLE and
+// reads its fields — a forward declaration would not be enough.
+typedef struct PtyHandle
+{
+    PHANDLE inputWriteSide;
+
+    PHANDLE outputReadSide;
+
+    HPCON hPty;
+
+    DWORD dwProcessId;
+
+    BOOL ackRead;
+
+    HANDLE hMutex;
+
+    PtyWriteQueue write_queue;
+
+} PtyHandle;
+
+// The read loop closes the queue when the pty ends, so it needs this before the
+// definition further down.
+static void pty_write_queue_close(PtyWriteQueue *queue);
 
 static LPWSTR build_command(char *executable, char **arguments)
 {
@@ -149,15 +226,18 @@ static LPWSTR build_working_directory(char *working_directory)
     return working_directory_block;
 }
 
+// The HANDLE, not a copy of its fields: the loop needs the pipe, the read
+// semaphore, the ack flag and the write queue, and listing them one by one meant
+// every new need changed this struct, the thread starter and the call site
+// together.
+//
+// [port] stays separate because it is the one thing that does NOT live on the
+// handle — it belongs to the create options.
 typedef struct ReadLoopOptions
 {
-    HANDLE fd;
+    PtyHandle *handle;
 
     Dart_Port port;
-
-    HANDLE hMutex;
-
-    BOOL ackRead;
 
 } ReadLoopOptions;
 
@@ -182,12 +262,12 @@ static DWORD WINAPI read_loop(LPVOID arg)
     {
         DWORD readlen = 0;
 
-        if (options->ackRead)
+        if (options->handle->ackRead)
         {
-            WaitForSingleObject(options->hMutex, INFINITE);
+            WaitForSingleObject(options->handle->hMutex, INFINITE);
         }
 
-        BOOL ok = ReadFile(options->fd, buffer, sizeof(buffer), &readlen, NULL);
+        BOOL ok = ReadFile((HANDLE)options->handle->outputReadSide, buffer, sizeof(buffer), &readlen, NULL);
 
         if (!ok)
         {
@@ -208,17 +288,17 @@ static DWORD WINAPI read_loop(LPVOID arg)
         Dart_PostCObject_DL(options->port, &result);
     }
 
+    pty_write_queue_close(&options->handle->write_queue);
+
     return 0;
 }
 
-static void start_read_thread(HANDLE fd, Dart_Port port, HANDLE mutex, BOOL ackRead)
+static void start_read_thread(PtyHandle *handle, Dart_Port port)
 {
     ReadLoopOptions *options = malloc(sizeof(ReadLoopOptions));
 
-    options->fd = fd;
+    options->handle = handle;
     options->port = port;
-    options->hMutex = mutex;
-    options->ackRead = ackRead;
 
     DWORD thread_id;
 
@@ -275,21 +355,134 @@ static void start_wait_exit_thread(HANDLE pid, Dart_Port port, HANDLE mutex)
     }
 }
 
-typedef struct PtyHandle
+// Writes every byte or reports how far it got.
+//
+// `WriteFile` on a pipe may report fewer bytes than asked for, so the single
+// unchecked call this replaces could drop the tail of a large paste.
+static size_t write_all(HANDLE fileHandle, const char *bytes, size_t length)
 {
-    PHANDLE inputWriteSide;
+    size_t written = 0;
 
-    PHANDLE outputReadSide;
+    while (written < length)
+    {
+        DWORD chunkWritten = 0;
 
-    HPCON hPty;
+        // DWORD is 32-bit while the queue counts in size_t, so a single write is
+        // capped rather than truncated by the conversion.
+        size_t remaining = length - written;
+        DWORD toWrite = remaining > MAXDWORD ? MAXDWORD : (DWORD)remaining;
 
-    DWORD dwProcessId;
+        if (!WriteFile(fileHandle, bytes + written, toWrite, &chunkWritten, NULL))
+        {
+            break;
+        }
 
-    BOOL ackRead;
+        if (chunkWritten == 0)
+        {
+            break;
+        }
 
-    HANDLE hMutex;
+        written += chunkWritten;
+    }
 
-} PtyHandle;
+    return written;
+}
+
+static DWORD WINAPI write_loop(LPVOID arg)
+{
+    PtyWriteQueue *queue = (PtyWriteQueue *)arg;
+
+    while (1)
+    {
+        EnterCriticalSection(&queue->lock);
+
+        while (queue->head == NULL && !queue->closed)
+        {
+            SleepConditionVariableCS(&queue->pending, &queue->lock, INFINITE);
+        }
+
+        // Drain first, THEN exit: bytes already accepted from the caller are
+        // still owed to the child.
+        if (queue->head == NULL)
+        {
+            LeaveCriticalSection(&queue->lock);
+
+            break;
+        }
+
+        PtyWriteChunk *chunk = queue->head;
+
+        queue->head = chunk->next;
+
+        if (queue->head == NULL)
+        {
+            queue->tail = NULL;
+        }
+
+        queue->queuedBytes -= chunk->length;
+
+        // The blocking write happens OUTSIDE the lock, so a stalled child cannot
+        // stop `pty_write` from queueing the next chunk.
+        LeaveCriticalSection(&queue->lock);
+
+        write_all(queue->fileHandle, chunk->bytes, chunk->length);
+
+        free(chunk->bytes);
+        free(chunk);
+    }
+
+    return 0;
+}
+
+// Returns TRUE on success. The CALLER MUST check it: a queue that silently
+// failed to start would send every keystroke down a path that does nothing.
+static BOOL pty_write_queue_init(PtyWriteQueue *queue, HANDLE fileHandle)
+{
+    queue->head = NULL;
+    queue->tail = NULL;
+    queue->queuedBytes = 0;
+    queue->fileHandle = fileHandle;
+    queue->running = FALSE;
+    queue->closed = FALSE;
+
+    InitializeCriticalSection(&queue->lock);
+    InitializeConditionVariable(&queue->pending);
+
+    DWORD threadId = 0;
+
+    HANDLE thread = CreateThread(NULL, 0, write_loop, queue, 0, &threadId);
+
+    if (thread == NULL)
+    {
+        DeleteCriticalSection(&queue->lock);
+
+        return FALSE;
+    }
+
+    CloseHandle(thread);
+
+    queue->running = TRUE;
+
+    return TRUE;
+}
+
+// Tells the writer thread the pty is finished, so it drains what it still holds
+// and then exits.
+static void pty_write_queue_close(PtyWriteQueue *queue)
+{
+    if (!queue->running)
+    {
+        return;
+    }
+
+    EnterCriticalSection(&queue->lock);
+
+    queue->closed = TRUE;
+
+    WakeConditionVariable(&queue->pending);
+
+    LeaveCriticalSection(&queue->lock);
+}
 
 char *error_message = NULL;
 
@@ -419,10 +612,9 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
         PTY_READ_CREDITS,   // maximum count
         NULL);
 
-    start_read_thread(outputReadSide, options->stdout_port, mutex, options->ackRead);
-
-    start_wait_exit_thread(processInfo.hProcess, options->exit_port, mutex);
-
+    // The handle is built BEFORE the threads start, because the read loop now
+    // takes it — and because the write queue must exist before anything can be
+    // written to the pty.
     PtyHandle *pty = malloc(sizeof(PtyHandle));
 
     if (pty == NULL)
@@ -438,18 +630,108 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     pty->ackRead = options->ackRead;
     pty->hMutex = mutex;
 
+    if (!pty_write_queue_init(&pty->write_queue, (HANDLE)inputWriteSide))
+    {
+        // Inline writes are what this replaced, so the terminal still works — it
+        // just regains the old risk of blocking the caller. Said out loud rather
+        // than swallowed.
+        fprintf(stderr, "flutter_pty: write queue unavailable (%lu), writing inline\n", GetLastError());
+    }
+
+    start_read_thread(pty, options->stdout_port);
+
+    start_wait_exit_thread(processInfo.hProcess, options->exit_port, mutex);
+
     return pty;
 }
 
 FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length)
 {
-    DWORD bytesWritten;
+    if (length <= 0)
+    {
+        return;
+    }
 
-    WriteFile(handle->inputWriteSide, buffer, length, &bytesWritten, NULL);
+    // No queue means the setup failed and said so at create time. Writing inline
+    // keeps the terminal usable — it can block the caller, which is the old
+    // behavior, and that beats dropping what the user typed.
+    if (!handle->write_queue.running)
+    {
+        write_all((HANDLE)handle->inputWriteSide, buffer, (size_t)length);
 
-    FlushFileBuffers(handle->inputWriteSide);
+        return;
+    }
 
-    return;
+    // COPIED because the caller frees its buffer as soon as this returns, while
+    // the writer thread reads it later.
+    char *bytes = (char *)malloc((size_t)length);
+
+    if (bytes == NULL)
+    {
+        fprintf(stderr, "flutter_pty: out of memory queueing %d bytes to write\n", length);
+
+        return;
+    }
+
+    memcpy(bytes, buffer, (size_t)length);
+
+    PtyWriteChunk *chunk = (PtyWriteChunk *)malloc(sizeof(PtyWriteChunk));
+
+    if (chunk == NULL)
+    {
+        free(bytes);
+
+        fprintf(stderr, "flutter_pty: out of memory queueing a write of %d bytes\n", length);
+
+        return;
+    }
+
+    chunk->bytes = bytes;
+    chunk->length = (size_t)length;
+    chunk->next = NULL;
+
+    EnterCriticalSection(&handle->write_queue.lock);
+
+    // The child is gone, so there is nobody left to read this.
+    if (handle->write_queue.closed)
+    {
+        LeaveCriticalSection(&handle->write_queue.lock);
+
+        free(chunk->bytes);
+        free(chunk);
+
+        return;
+    }
+
+    if (handle->write_queue.queuedBytes + (size_t)length > PTY_WRITE_QUEUE_MAX_BYTES)
+    {
+        LeaveCriticalSection(&handle->write_queue.lock);
+
+        free(chunk->bytes);
+        free(chunk);
+
+        fprintf(stderr, "flutter_pty: write queue full (%zu bytes unread by the child), dropped %d bytes\n",
+                handle->write_queue.queuedBytes, length);
+
+        return;
+    }
+
+    if (handle->write_queue.tail == NULL)
+    {
+        handle->write_queue.head = chunk;
+        handle->write_queue.tail = chunk;
+    }
+    else
+    {
+        handle->write_queue.tail->next = chunk;
+        handle->write_queue.tail = chunk;
+    }
+
+    handle->write_queue.queuedBytes += (size_t)length;
+
+    WakeConditionVariable(&handle->write_queue.pending);
+
+    LeaveCriticalSection(&handle->write_queue.lock);
 }
 
 FFI_PLUGIN_EXPORT void pty_ack_read(PtyHandle *handle)
