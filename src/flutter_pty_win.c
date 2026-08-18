@@ -645,9 +645,20 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     return pty;
 }
 
-FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length)
+// `bypassLineDiscipline` is read and ignored: a Windows pty is a PIPE with no
+// line discipline, so there is no canonical mode to step around and no per-line
+// limit to hit. The field exists so both platforms present one signature.
+FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, PtyWriteOptions *options)
 {
-    if (length <= 0)
+    if (options == NULL)
+    {
+        return;
+    }
+
+    char *buffer = options->buffer;
+    const int length = options->length;
+
+    if (buffer == NULL || length <= 0)
     {
         return;
     }

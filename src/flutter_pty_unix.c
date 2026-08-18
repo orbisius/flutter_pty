@@ -4,6 +4,7 @@
 #include <stdlib.h>
 
 #include <errno.h>
+#include <poll.h>
 #include <pthread.h>
 #include <string.h>
 #include <unistd.h>
@@ -133,6 +134,21 @@ typedef struct PtyWriteChunk
 
     size_t length;
 
+    // Deliver this chunk with the line discipline's CANONICAL mode switched off,
+    // then switch it back.
+    //
+    // Canonical mode hands the program whole lines and cannot hand over one
+    // longer than MAX_CANON (1024). Past that the tty stops accepting input
+    // entirely, so a paste containing one long line wedges the terminal — and
+    // splitting the write does not help, because the limit is on the LINE, not
+    // on the write. Measured: a 4096-byte line delivers 0 bytes at every chunk
+    // size from 64 bytes up, and 4096 of 4096 with canonical mode off.
+    //
+    // The flip lives HERE, on the writing thread, because it has to be ordered
+    // with the bytes: restoring from the caller would race the queue and wedge
+    // the tty again.
+    bool bypassLineDiscipline;
+
     struct PtyWriteChunk *next;
 
 } PtyWriteChunk;
@@ -142,6 +158,11 @@ typedef struct PtyWriteChunk
 // reading forever. Reaching it drops the newest write and says so, because the
 // alternative — growing until the process is killed — loses the whole session.
 #define PTY_WRITE_QUEUE_MAX_BYTES (256 * 1024 * 1024)
+
+// How long a single wait for the pty to accept more may last. It only bounds one
+// iteration — the write is retried until it completes — so this is a wake-up
+// interval, not a deadline on the write.
+#define PTY_WRITE_WAIT_MILLISECONDS 100
 
 typedef struct PtyWriteQueue
 {
@@ -198,10 +219,35 @@ static size_t write_all(int fd, const char *bytes, size_t length)
 
         if (result < 0)
         {
+            // A signal arriving mid-write is a retry, not a failure: truncating
+            // there would lose the rest of what the user typed or pasted.
             if (errno == EINTR)
             {
                 continue;
             }
+
+            // The fd reports "not now" rather than an error. A pty master can do
+            // this whenever the slave's input queue is full — so WAIT for room
+            // instead of abandoning the tail, which is how a large paste used to
+            // stop halfway with nothing said about it.
+            if (errno == EAGAIN || errno == EWOULDBLOCK)
+            {
+                struct pollfd waiter;
+
+                waiter.fd = fd;
+                waiter.events = POLLOUT;
+                waiter.revents = 0;
+
+                poll(&waiter, 1, PTY_WRITE_WAIT_MILLISECONDS);
+
+                continue;
+            }
+
+            // Anything else is a real failure, and the bytes are gone. SAY SO:
+            // a silent short write is indistinguishable from a terminal that
+            // simply stopped listening.
+            fprintf(stderr, "flutter_pty: write failed after %zu of %zu bytes (errno %d)\n",
+                    written, length, errno);
 
             break;
         }
@@ -210,6 +256,52 @@ static size_t write_all(int fd, const char *bytes, size_t length)
     }
 
     return written;
+}
+
+// Writes one chunk, taking the tty out of canonical mode first when the chunk
+// asks for it and putting it back afterwards.
+//
+// The restore runs even when the write fails: leaving a terminal in a mode its
+// program did not choose is worse than the failed write, because the user is
+// then typing into a line discipline that no longer echoes or edits the way the
+// program expects.
+static void write_chunk(int fd, PtyWriteChunk *chunk)
+{
+    if (!chunk->bypassLineDiscipline)
+    {
+        write_all(fd, chunk->bytes, chunk->length);
+
+        return;
+    }
+
+    struct termios original;
+
+    // No termios means this is not a tty we can reshape — write it as it is
+    // rather than refusing to write at all.
+    if (tcgetattr(fd, &original) != 0)
+    {
+        write_all(fd, chunk->bytes, chunk->length);
+
+        return;
+    }
+
+    struct termios delivery = original;
+
+    delivery.c_lflag &= ~((tcflag_t)ICANON);
+
+    if (tcsetattr(fd, TCSANOW, &delivery) != 0)
+    {
+        write_all(fd, chunk->bytes, chunk->length);
+
+        return;
+    }
+
+    write_all(fd, chunk->bytes, chunk->length);
+
+    // TCSADRAIN, not TCSANOW: canonical mode must not come back until the bytes
+    // already handed to the tty have gone out, or the tail of the chunk meets
+    // the very limit this avoided.
+    tcsetattr(fd, TCSADRAIN, &original);
 }
 
 static void *write_loop(void *arg)
@@ -250,7 +342,7 @@ static void *write_loop(void *arg)
         // stop `pty_write` from queueing the next chunk.
         pthread_mutex_unlock(&queue->mutex);
 
-        write_all(queue->fd, chunk->bytes, chunk->length);
+        write_chunk(queue->fd, chunk);
 
         free(chunk->bytes);
         free(chunk);
@@ -560,9 +652,18 @@ FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options)
     return handle;
 }
 
-FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length)
+FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, PtyWriteOptions *options)
 {
-    if (length <= 0)
+    if (options == NULL)
+    {
+        return;
+    }
+
+    char *buffer = options->buffer;
+    const int length = options->length;
+    const bool bypassLineDiscipline = options->bypassLineDiscipline;
+
+    if (buffer == NULL || length <= 0)
     {
         return;
     }
@@ -572,7 +673,14 @@ FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length)
     // behavior, and that beats dropping what the user typed.
     if (!handle->write_queue.running)
     {
-        write_all(handle->ptm, buffer, (size_t)length);
+        PtyWriteChunk inlineChunk;
+
+        inlineChunk.bytes = buffer;
+        inlineChunk.length = (size_t)length;
+        inlineChunk.bypassLineDiscipline = bypassLineDiscipline;
+        inlineChunk.next = NULL;
+
+        write_chunk(handle->ptm, &inlineChunk);
 
         return;
     }
@@ -603,6 +711,7 @@ FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length)
 
     chunk->bytes = bytes;
     chunk->length = (size_t)length;
+    chunk->bypassLineDiscipline = bypassLineDiscipline;
     chunk->next = NULL;
 
     pthread_mutex_lock(&handle->write_queue.mutex);

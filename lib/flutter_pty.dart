@@ -183,11 +183,33 @@ class Pty {
   /// The process id of the process running in the pseudo-terminal.
   int get pid => _bindings.pty_getpid(_handle);
 
+  /// Allocated ONCE and reused for every write, because this is the keystroke
+  /// path — a struct per character would be an allocation per character. Writes
+  /// all come from the one isolate that owns this Pty, so there is no second
+  /// writer to race with it.
+  late final Pointer<PtyWriteOptions> _writeOptions = calloc<PtyWriteOptions>();
+
   /// Write data to the pseudo-terminal.
-  void write(Uint8List data) {
+  ///
+  /// [bypassLineDiscipline] delivers this write with the terminal's CANONICAL
+  /// mode switched off and switches it back afterwards. Canonical mode hands the
+  /// program whole lines and cannot hand over one longer than MAX_CANON (1024):
+  /// past that the terminal stops accepting input at all, so a paste holding one
+  /// long line wedges the session until the program is interrupted. Splitting the
+  /// write does NOT avoid it, because the limit is on the LINE, not the write.
+  ///
+  /// Leave it false for ordinary input — a terminal should not reshape a
+  /// program's tty for a keystroke. Windows has no line discipline and ignores it.
+  void write(Uint8List data, {bool bypassLineDiscipline = false}) {
     final buf = malloc<Int8>(data.length);
     buf.asTypedList(data.length).setAll(0, data);
-    _bindings.pty_write(_handle, buf.cast(), data.length);
+
+    _writeOptions.ref.buffer = buf.cast();
+    _writeOptions.ref.length = data.length;
+    _writeOptions.ref.bypassLineDiscipline = bypassLineDiscipline;
+
+    _bindings.pty_write(_handle, _writeOptions);
+
     malloc.free(buf);
   }
 

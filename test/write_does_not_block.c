@@ -94,7 +94,14 @@ int main(void)
 
     gettimeofday(&start, NULL);
 
-    pty_write(handle, payload, TEST_WRITE_BYTES);
+    PtyWriteOptions write;
+
+    memset(&write, 0, sizeof(write));
+
+    write.buffer = payload;
+    write.length = TEST_WRITE_BYTES;
+
+    pty_write(handle, &write);
 
     double elapsed = seconds_since(start);
 

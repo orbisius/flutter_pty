@@ -54,7 +54,33 @@ typedef struct PtyHandle PtyHandle;
 
 FFI_PLUGIN_EXPORT PtyHandle *pty_create(PtyOptions *options);
 
-FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, char *buffer, int length);
+/// What to send to the pty, in the same shape as [PtyOptions] — a struct rather
+/// than a growing argument list, so a new capability adds a FIELD instead of
+/// changing the signature and every call site with it.
+typedef struct PtyWriteOptions
+{
+    char *buffer;
+
+    int length;
+
+    /// Deliver this write with the terminal's CANONICAL mode switched off, then
+    /// switch it back.
+    ///
+    /// Canonical mode hands the program whole lines and cannot hand over one
+    /// longer than MAX_CANON (1024): past that the tty stops accepting input at
+    /// all, so a paste holding one long line wedges the session until the program
+    /// is interrupted. Splitting the write does NOT avoid it — the limit is on
+    /// the LINE, not the write (measured at every chunk size from 64 bytes up).
+    ///
+    /// False for ordinary input: a terminal should not reshape a program's tty
+    /// for a keystroke. Windows has no line discipline and ignores this.
+    bool bypassLineDiscipline;
+
+} PtyWriteOptions;
+
+/// Sends [options] to the pty. The bytes are COPIED and queued, so this returns
+/// immediately and never blocks the caller.
+FFI_PLUGIN_EXPORT void pty_write(PtyHandle *handle, PtyWriteOptions *options);
 
 FFI_PLUGIN_EXPORT void pty_ack_read(PtyHandle *handle);
 

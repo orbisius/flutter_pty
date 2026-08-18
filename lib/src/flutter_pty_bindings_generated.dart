@@ -389,22 +389,20 @@ class FlutterPtyBindings {
 
   void pty_write(
     ffi.Pointer<PtyHandle> handle,
-    ffi.Pointer<ffi.Char> buffer,
-    int length,
+    ffi.Pointer<PtyWriteOptions> options,
   ) {
-    return _pty_write(
+    _pty_write(
       handle,
-      buffer,
-      length,
+      options,
     );
   }
 
   late final _pty_writePtr = _lookup<
       ffi.NativeFunction<
-          ffi.Void Function(ffi.Pointer<PtyHandle>, ffi.Pointer<ffi.Char>,
-              ffi.Int)>>('pty_write');
+          ffi.Void Function(ffi.Pointer<PtyHandle>,
+              ffi.Pointer<PtyWriteOptions>)>>('pty_write');
   late final _pty_write = _pty_writePtr.asFunction<
-      void Function(ffi.Pointer<PtyHandle>, ffi.Pointer<ffi.Char>, int)>();
+      void Function(ffi.Pointer<PtyHandle>, ffi.Pointer<PtyWriteOptions>)>();
 
   void pty_ack_read(
     ffi.Pointer<PtyHandle> handle,
@@ -748,6 +746,21 @@ typedef Dart_EnterScope_Type
     = ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>;
 typedef Dart_ExitScope_Type
     = ffi.Pointer<ffi.NativeFunction<ffi.Void Function()>>;
+
+/// What to send to the pty. A struct rather than a growing argument list, so a
+/// new capability adds a FIELD instead of changing the signature.
+final class PtyWriteOptions extends ffi.Struct {
+  external ffi.Pointer<ffi.Char> buffer;
+
+  @ffi.Int()
+  external int length;
+
+  /// Deliver this write with the terminal's CANONICAL mode switched off, then
+  /// switch it back — the only way to hand a program a line longer than
+  /// MAX_CANON (1024), which otherwise stops the tty accepting input at all.
+  @ffi.Bool()
+  external bool bypassLineDiscipline;
+}
 
 final class PtyOptions extends ffi.Struct {
   @ffi.Int()
